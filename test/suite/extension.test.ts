@@ -319,6 +319,36 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     assert.ok(commands.includes('reverseProxy.showKeyProjectStatus'));
   });
 
+  test('log lines should include local timestamp prefix', async () => {
+    const line = (await vscode.commands.executeCommand(
+      'reverseProxy.test.formatLogLine',
+      '[start] ssh test',
+      '2026-05-06T07:08:09.123'
+    )) as string;
+
+    assert.strictEqual(line, '[2026-05-06 07:08:09.123] [start] ssh test');
+  });
+
+  test('repeated local target connection failures should be throttled', async () => {
+    const results = (await vscode.commands.executeCommand(
+      'reverseProxy.test.shouldLogSshStderrSequence',
+      [
+        'connect to 127.0.0.1 port 7897 failed: No error',
+        'socket: No error',
+        'connect to 127.0.0.1 port 7897 failed: No error',
+        'socket: No error',
+        'connect to 127.0.0.1 port 7897 failed: No error',
+        'socket: No error',
+        'Warning: remote port forwarding failed for listen port 17897'
+      ],
+      '127.0.0.1',
+      7897,
+      [0, 1, 10_000, 10_001, 31_000, 31_001, 31_002]
+    )) as boolean[];
+
+    assert.deepStrictEqual(results, [true, false, false, false, true, false, true]);
+  });
+
   test('manifest should restrict extensionKind to ui', () => {
     const packageJsonPath = path.resolve(__dirname, '../../package.json');
     const manifest = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as {

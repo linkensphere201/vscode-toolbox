@@ -16,6 +16,8 @@ let toolBoxWebviewProvider: ToolBoxWebviewProvider | null = null;
 let keyProjectsWorkspaceOverride: string | null = null;
 let keyProjectsCache: KeyProjectsCache | null = null;
 let keyProjectsRefreshPromise: Promise<void> | null = null;
+const LOCAL_TARGET_CONNECT_FAILURE_LOG_INTERVAL_MS = 30_000;
+const LOCAL_TARGET_CONNECT_FAILURE_CONTEXT_MS = 30_000;
 
 type ProxyState = 'stopped' | 'starting' | 'connected' | 'failed';
 let proxyState: ProxyState = 'stopped';
@@ -142,6 +144,86 @@ type SidebarTestItem = {
   enabled: boolean;
   parentLabel?: string;
 };
+
+type SshStderrLogState = {
+  lastLocalTargetConnectFailureLogAt: Map<string, number>;
+  localTargetConnectFailureContextUntilMs: number;
+};
+
+function padDatePart(value: number, length = 2): string {
+  return String(value).padStart(length, '0');
+}
+
+function formatLogTimestamp(date = new Date()): string {
+  return [
+    date.getFullYear(),
+    '-',
+    padDatePart(date.getMonth() + 1),
+    '-',
+    padDatePart(date.getDate()),
+    ' ',
+    padDatePart(date.getHours()),
+    ':',
+    padDatePart(date.getMinutes()),
+    ':',
+    padDatePart(date.getSeconds()),
+    '.',
+    padDatePart(date.getMilliseconds(), 3)
+  ].join('');
+}
+
+function formatLogLine(message: string, date = new Date()): string {
+  return `[${formatLogTimestamp(date)}] ${message}`;
+}
+
+function createTimestampedOutputChannel(channel: vscode.OutputChannel): vscode.OutputChannel {
+  const appendLine = channel.appendLine.bind(channel);
+  channel.appendLine = (value: string): void => {
+    const lines = value.split(/\r?\n/);
+    for (const line of lines) {
+      appendLine(formatLogLine(line));
+    }
+  };
+  return channel;
+}
+
+function getLocalTargetConnectFailureKey(text: string, config: Pick<FileProxyConfig, 'localHost' | 'localPort'>): string | null {
+  const hostPattern = new RegExp(`(^|[^\\w.:-])${escapeRegExp(config.localHost)}([^\\w.:-]|$)`, 'i');
+  const portPattern = new RegExp(`(^|[^\\d])(?:port\\s+|:)${config.localPort}([^\\d]|$)`, 'i');
+  const connectFailurePattern = /connect|connection|refused|failed|no error|连接|无法连接/i;
+
+  if (!hostPattern.test(text) || !portPattern.test(text) || !connectFailurePattern.test(text)) {
+    return null;
+  }
+
+  return `${config.localHost}:${config.localPort}`;
+}
+
+function shouldLogSshStderr(
+  text: string,
+  config: Pick<FileProxyConfig, 'localHost' | 'localPort'>,
+  nowMs: number,
+  state: SshStderrLogState
+): boolean {
+  const localTargetKey = getLocalTargetConnectFailureKey(text, config);
+  if (!localTargetKey) {
+    if (/^socket:\s*no error$/i.test(text) && nowMs < state.localTargetConnectFailureContextUntilMs) {
+      return false;
+    }
+
+    return true;
+  }
+
+  state.localTargetConnectFailureContextUntilMs = nowMs + LOCAL_TARGET_CONNECT_FAILURE_CONTEXT_MS;
+
+  const lastLoggedAt = state.lastLocalTargetConnectFailureLogAt.get(localTargetKey);
+  if (lastLoggedAt !== undefined && nowMs - lastLoggedAt < LOCAL_TARGET_CONNECT_FAILURE_LOG_INTERVAL_MS) {
+    return false;
+  }
+
+  state.lastLocalTargetConnectFailureLogAt.set(localTargetKey, nowMs);
+  return true;
+}
 
 function getStateLabel(state: ProxyState): string {
   if (state === 'starting') {
@@ -2342,6 +2424,10 @@ async function startProxy(): Promise<void> {
   stopRequested = false;
   externalTunnelPid = null;
   let hasFailed = false;
+  const stderrLogState: SshStderrLogState = {
+    lastLocalTargetConnectFailureLogAt: new Map<string, number>(),
+    localTargetConnectFailureContextUntilMs: 0
+  };
   const markFailed = (message: string): void => {
     if (hasFailed) {
       return;
@@ -2367,9 +2453,19 @@ async function startProxy(): Promise<void> {
   });
 
   sshProcess.stderr.on('data', (data: Buffer) => {
-    const text = data.toString().trim();
-    outputChannel.appendLine(`[stderr] ${text}`);
+    const lines = data
+      .toString()
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
 
+    for (const text of lines) {
+      if (shouldLogSshStderr(text, config, Date.now(), stderrLogState)) {
+        outputChannel.appendLine(`[stderr] ${text}`);
+      }
+    }
+
+    const text = lines.join('\n');
     if (/remote port forwarding failed/i.test(text) || /address already in use/i.test(text)) {
       markFailed(`Reverse proxy failed: remote port ${config.remoteBindPort} is already in use.`);
       if (sshProcess) {
@@ -2526,7 +2622,7 @@ async function openSettingsConfig(): Promise<void> {
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionContextRef = context;
-  outputChannel = vscode.window.createOutputChannel('Reverse Proxy');
+  outputChannel = createTimestampedOutputChannel(vscode.window.createOutputChannel('Reverse Proxy'));
   keyStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 150);
   keyStatusBarItem.command = 'reverseProxy.refreshKeyProjects';
   keyStatusBarItem.text = '$(bookmark) not loaded';
@@ -2708,6 +2804,24 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('reverseProxy.test.getWindowsProcessInspectionScript', () => {
       return buildWindowsProcessInspectionScript();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('reverseProxy.test.formatLogLine', (message: string, isoDate: string) => {
+      return formatLogLine(message, new Date(isoDate));
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('reverseProxy.test.shouldLogSshStderrSequence', (messages: string[], localHost: string, localPort: number, offsetsMs: number[]) => {
+      const stderrLogState: SshStderrLogState = {
+        lastLocalTargetConnectFailureLogAt: new Map<string, number>(),
+        localTargetConnectFailureContextUntilMs: 0
+      };
+      return messages.map((message, index) =>
+        shouldLogSshStderr(message, { localHost, localPort }, offsetsMs[index] ?? 0, stderrLogState)
+      );
     })
   );
 
