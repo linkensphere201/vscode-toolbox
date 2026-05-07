@@ -1100,7 +1100,7 @@ function renderToolBoxWebview(webview: vscode.Webview, model: ToolBoxViewModel):
       </div>
     </section>
     <section class="key-block">
-      <div class="eyebrow key-title">Key Projects</div>
+      <div class="eyebrow key-title">Pinned Projects</div>
       <section class="panel key-panel">
         <div class="key-toolbar">${keyToolbar}</div>
         <div class="key-body">${keyBody}</div>
@@ -1406,7 +1406,7 @@ async function getKeyProjectSidebarItemsForTest(): Promise<SidebarTestItem[]> {
       label: issue,
       tooltip: issue,
       enabled: false,
-      parentLabel: 'Key Projects'
+      parentLabel: 'Pinned Projects'
     });
   } else {
     const cached = getCachedKeyProjectStatuses(config);
@@ -1424,7 +1424,7 @@ async function getKeyProjectSidebarItemsForTest(): Promise<SidebarTestItem[]> {
           command: 'reverseProxy.showKeyProjectStatus',
           arguments: [status.configuredRepoName],
           enabled: true,
-          parentLabel: 'Key Projects'
+          parentLabel: 'Pinned Projects'
         });
       }
     } else {
@@ -1433,7 +1433,7 @@ async function getKeyProjectSidebarItemsForTest(): Promise<SidebarTestItem[]> {
         label: 'Click Refresh to load key project status.',
         tooltip: 'Click Refresh to load key project status.',
         enabled: false,
-        parentLabel: 'Key Projects'
+        parentLabel: 'Pinned Projects'
       });
     }
   }
@@ -1443,14 +1443,14 @@ async function getKeyProjectSidebarItemsForTest(): Promise<SidebarTestItem[]> {
     label: keyProjectsRefreshPromise ? 'Refreshing...' : 'Refresh',
     command: keyProjectsRefreshPromise ? undefined : 'reverseProxy.refreshKeyProjects',
     enabled: !keyProjectsRefreshPromise,
-    parentLabel: 'Key Projects'
+    parentLabel: 'Pinned Projects'
   });
   items.push({
     kind: 'action',
     label: 'Settings',
     command: 'reverseProxy.openKeyProjectSettings',
     enabled: true,
-    parentLabel: 'Key Projects'
+    parentLabel: 'Pinned Projects'
   });
 
   return items;
@@ -1460,7 +1460,7 @@ async function getSidebarItemsForTest(): Promise<{ root: SidebarTestItem[]; chil
   return {
     root: [
       { kind: 'group', label: 'ReverseTunnel', enabled: false },
-      { kind: 'group', label: 'Key Projects', enabled: false }
+      { kind: 'group', label: 'Pinned Projects', enabled: false }
     ],
     children: [...getReverseTunnelSidebarItemsForTest(), ...(await getKeyProjectSidebarItemsForTest())]
   };

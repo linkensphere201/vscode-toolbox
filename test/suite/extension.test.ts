@@ -436,10 +436,10 @@ suite('Reverse Proxy Extension Integration Tests', () => {
 
     const tree = await getSidebarSnapshot();
     const reverseChildren = tree.children.filter((child) => child.parentLabel === 'ReverseTunnel');
-    const keyProjectChildren = tree.children.filter((child) => child.parentLabel === 'Key Projects');
+    const keyProjectChildren = tree.children.filter((child) => child.parentLabel === 'Pinned Projects');
 
     assert.strictEqual(tree.root.length, 2, `Expected two root groups, got ${tree.root.length}`);
-    assert.deepStrictEqual(tree.root.map((item) => item.label), ['ReverseTunnel', 'Key Projects']);
+    assert.deepStrictEqual(tree.root.map((item) => item.label), ['ReverseTunnel', 'Pinned Projects']);
     assert.strictEqual(reverseChildren.length, 3, `Expected three reverse tunnel items, got ${reverseChildren.length}`);
     assert.strictEqual(reverseChildren[0]?.label, '10.99.0.1:4001: Stopped');
     assert.strictEqual(reverseChildren[1]?.label, 'Open Logs');
@@ -577,12 +577,12 @@ suite('Reverse Proxy Extension Integration Tests', () => {
 
     try {
       await setKeyProjectsWorkspaceOverride(workspaceDir);
-      let items = await getSidebarChildren('Key Projects');
+      let items = await getSidebarChildren('Pinned Projects');
       assert.deepStrictEqual(items.map((item) => item.label), ['Click Refresh to load key project status.', 'Refresh', 'Settings']);
 
       await vscode.commands.executeCommand('reverseProxy.refreshKeyProjects');
 
-      items = await getSidebarChildren('Key Projects');
+      items = await getSidebarChildren('Pinned Projects');
       assert.deepStrictEqual(items.map((item) => item.label), ['\u2757 dirty-repo.git: feature-dirty - behind 2', '\u2714\uFE0F clean-repo.git: main - synced', 'Refresh', 'Settings']);
       assert.ok(items[0]?.tooltip?.includes('- repo: `dirty-repo.git`') && items[0]?.tooltip?.includes('- remote: `behind 2`'));
       assert.ok(items[0]?.tooltip?.includes('- upstream: `origin/feature-dirty`'));
@@ -591,7 +591,7 @@ suite('Reverse Proxy Extension Integration Tests', () => {
       assert.ok(items[1]?.tooltip?.includes('- changes: `working tree clean`'));
 
       const clicked = (await vscode.commands.executeCommand('reverseProxy.test.clickSidebarItem', {
-        parentLabel: 'Key Projects',
+        parentLabel: 'Pinned Projects',
         label: '\u2757 dirty-repo.git: feature-dirty - behind 2'
       })) as string;
       assert.ok(clicked.includes('repo=dirty-repo.git'));
@@ -627,12 +627,12 @@ suite('Reverse Proxy Extension Integration Tests', () => {
 
     try {
       await setKeyProjectsWorkspaceOverride(workspaceDir);
-      let items = await getSidebarChildren('Key Projects');
+      let items = await getSidebarChildren('Pinned Projects');
       assert.deepStrictEqual(items.map((item) => item.label), ['Click Refresh to load key project status.', 'Refresh', 'Settings']);
 
       await vscode.commands.executeCommand('reverseProxy.refreshKeyProjects');
 
-      items = await getSidebarChildren('Key Projects');
+      items = await getSidebarChildren('Pinned Projects');
       assert.deepStrictEqual(items.map((item) => item.label), ['\u2757 dirty-repo.git: feature-ssh - diverged +1/-1', '\u2714\uFE0F clean-repo.git: main - synced', 'Refresh', 'Settings']);
       assert.ok(items[0]?.tooltip?.includes('- repo: `dirty-repo.git`') && items[0]?.tooltip?.includes('- path: `/remote/dirty-repo`'));
       assert.ok(items[0]?.tooltip?.includes('- remote: `diverged +1/-1`'));
@@ -665,7 +665,7 @@ suite('Reverse Proxy Extension Integration Tests', () => {
       const pending = vscode.commands.executeCommand('reverseProxy.refreshKeyProjects');
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      const items = await getSidebarChildren('Key Projects');
+      const items = await getSidebarChildren('Pinned Projects');
       assert.ok(items.some((item) => item.label === 'Refreshing...'));
 
       await pending;
@@ -696,13 +696,13 @@ suite('Reverse Proxy Extension Integration Tests', () => {
       await setKeyProjectsWorkspaceOverride(workspaceDir);
       await vscode.commands.executeCommand('reverseProxy.refreshKeyProjects');
 
-      const items = await getSidebarChildren('Key Projects');
+      const items = await getSidebarChildren('Pinned Projects');
       assert.deepStrictEqual(items.map((item) => item.label), ['\u2714\uFE0F root-repo.git: main - synced', 'Refresh', 'Settings']);
       assert.ok(items[0]?.tooltip?.includes('- repo: `root-repo.git`'));
       assert.ok(items[0]?.tooltip?.includes('- remote: `synced`'));
 
       const clicked = (await vscode.commands.executeCommand('reverseProxy.test.clickSidebarItem', {
-        parentLabel: 'Key Projects',
+        parentLabel: 'Pinned Projects',
         label: '\u2714\uFE0F root-repo.git: main - synced'
       })) as string;
       assert.ok(clicked.includes('repo=root-repo.git'));
