@@ -4,38 +4,56 @@ import * as path from 'path';
 import * as os from 'os';
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 
-let sshProcess: ChildProcessWithoutNullStreams | null = null;
-let externalTunnelPid: number | null = null;
 let outputChannel: vscode.OutputChannel;
 let statusBarItem: vscode.StatusBarItem;
 let keyStatusBarItem: vscode.StatusBarItem;
-let connectTimer: NodeJS.Timeout | null = null;
-let stopRequested = false;
 let extensionContextRef: vscode.ExtensionContext | null = null;
 let toolBoxWebviewProvider: ToolBoxWebviewProvider | null = null;
 let keyProjectsWorkspaceOverride: string | null = null;
 let keyProjectsCache: KeyProjectsCache | null = null;
 let keyProjectsRefreshPromise: Promise<void> | null = null;
+const remoteTunnelStates = new Map<string, RemoteTunnelRuntimeState>();
 const LOCAL_TARGET_CONNECT_FAILURE_LOG_INTERVAL_MS = 30_000;
 const LOCAL_TARGET_CONNECT_FAILURE_CONTEXT_MS = 30_000;
 
-type ProxyState = 'stopped' | 'starting' | 'connected' | 'failed';
-let proxyState: ProxyState = 'stopped';
+type ProxyState = 'stopped' | 'starting' | 'connected' | 'external' | 'failed';
 
-type FileProxyConfig = {
-  sshPath: string;
-  connectionReadyDelayMs: number;
+type RemoteProxyConfig = {
   remoteHost: string;
   remotePort: number;
   remoteUser: string;
   remoteBindPort: number;
-  localHost: string;
-  localPort: number;
   identityFile: string;
 };
 
-type RuntimeProxyConfig = FileProxyConfig & {
+type FileProxyConfig = {
+  sshPath: string;
+  connectionReadyDelayMs: number;
+  localHost: string;
+  localPort: number;
+  remotes: RemoteProxyConfig[];
+};
+
+type RuntimeRemoteProxyConfig = RemoteProxyConfig & {
+  key: string;
+  hostLabel: string;
+  remoteTarget: string;
+  reverseSpec: string;
+};
+
+type RuntimeProxyConfig = Omit<FileProxyConfig, 'remotes'> & {
   loadedConfigPath: string;
+  remotes: RuntimeRemoteProxyConfig[];
+};
+
+type RemoteTunnelRuntimeState = {
+  state: ProxyState;
+  sshProcess: ChildProcessWithoutNullStreams | null;
+  externalPid: number | null;
+  connectTimer: NodeJS.Timeout | null;
+  stopRequested: boolean;
+  lastError: string | null;
+  stderrLogState: SshStderrLogState;
 };
 
 type ExistingTunnelMatch = {
@@ -117,16 +135,31 @@ type KeyProjectsViewModel = {
 };
 
 type ToolBoxAction = {
-  id: 'toggle' | 'logs' | 'proxySettings' | 'keyRefresh' | 'keySettings';
+  id: 'logs' | 'proxySettings' | 'keyRefresh' | 'keySettings';
   label: string;
   enabled: boolean;
+};
+
+type ReverseTunnelViewRow = {
+  key: string;
+  hostLabel: string;
+  targetLabel: string;
+  bindLabel: string;
+  stateLabel: string;
+  tone: 'connected' | 'external' | 'starting' | 'failed' | 'stopped';
+  tooltip: string;
+  action: 'start' | 'stop' | 'none';
+  actionLabel: string;
+  actionEnabled: boolean;
 };
 
 type ReverseTunnelViewModel = {
   stateLabel: string;
   detail: string;
-  tone: 'connected' | 'starting' | 'failed' | 'stopped';
+  tone: 'connected' | 'external' | 'starting' | 'failed' | 'stopped';
   actions: ToolBoxAction[];
+  issue: string | null;
+  rows: ReverseTunnelViewRow[];
 };
 
 type ToolBoxViewModel = {
@@ -230,7 +263,10 @@ function getStateLabel(state: ProxyState): string {
     return 'Starting';
   }
   if (state === 'connected') {
-    return 'Connected';
+    return 'Started';
+  }
+  if (state === 'external') {
+    return 'Started';
   }
   if (state === 'failed') {
     return 'Failed';
@@ -238,9 +274,12 @@ function getStateLabel(state: ProxyState): string {
   return 'Stopped';
 }
 
-function getReverseTunnelTone(state: ProxyState): ReverseTunnelViewModel['tone'] {
+function getReverseTunnelTone(state: ProxyState): ReverseTunnelViewRow['tone'] {
   if (state === 'connected') {
     return 'connected';
+  }
+  if (state === 'external') {
+    return 'external';
   }
   if (state === 'starting') {
     return 'starting';
@@ -251,26 +290,8 @@ function getReverseTunnelTone(state: ProxyState): ReverseTunnelViewModel['tone']
   return 'stopped';
 }
 
-function getReverseTunnelDetail(state: ProxyState): string {
-  if (state === 'connected') {
-    return '';
-  }
-  if (state === 'starting') {
-    return '';
-  }
-  if (state === 'failed') {
-    return '';
-  }
-  return '';
-}
-
 function getReverseTunnelActions(): ToolBoxAction[] {
   return [
-    {
-      id: 'toggle',
-      label: proxyState === 'connected' ? 'Stop' : proxyState === 'starting' ? 'Connecting...' : 'Start',
-      enabled: proxyState !== 'starting'
-    },
     {
       id: 'logs',
       label: 'Logs',
@@ -282,6 +303,120 @@ function getReverseTunnelActions(): ToolBoxAction[] {
       enabled: true
     }
   ];
+}
+
+function getRemoteKey(remote: Pick<RemoteProxyConfig, 'remoteUser' | 'remoteHost' | 'remotePort'>): string {
+  return `${remote.remoteUser}@${remote.remoteHost}:${remote.remotePort}`;
+}
+
+function createSshStderrLogState(): SshStderrLogState {
+  return {
+    lastLocalTargetConnectFailureLogAt: new Map<string, number>(),
+    localTargetConnectFailureContextUntilMs: 0
+  };
+}
+
+function getOrCreateRemoteTunnelState(remoteKey: string): RemoteTunnelRuntimeState {
+  const existing = remoteTunnelStates.get(remoteKey);
+  if (existing) {
+    return existing;
+  }
+
+  const created: RemoteTunnelRuntimeState = {
+    state: 'stopped',
+    sshProcess: null,
+    externalPid: null,
+    connectTimer: null,
+    stopRequested: false,
+    lastError: null,
+    stderrLogState: createSshStderrLogState()
+  };
+  remoteTunnelStates.set(remoteKey, created);
+  return created;
+}
+
+function getReverseTunnelAggregateState(rows: ReverseTunnelViewRow[]): ProxyState {
+  if (rows.some((row) => row.tone === 'failed')) {
+    return 'failed';
+  }
+  if (rows.some((row) => row.tone === 'starting')) {
+    return 'starting';
+  }
+  if (rows.some((row) => row.tone === 'connected')) {
+    return 'connected';
+  }
+  if (rows.some((row) => row.tone === 'external')) {
+    return 'external';
+  }
+  return 'stopped';
+}
+
+function formatRemoteTunnelTooltip(remote: RuntimeRemoteProxyConfig, state: RemoteTunnelRuntimeState): string {
+  const lines = [
+    `target: ${remote.remoteTarget}`,
+    `ssh: ${remote.remoteHost}:${remote.remotePort}`,
+    `bind: ${remote.remoteBindPort}`,
+    `local: ${remote.reverseSpec.split(':').slice(1).join(':')}`,
+    `state: ${getStateLabel(state.state)}`
+  ];
+
+  if (state.externalPid) {
+    lines.push(`Started externally, pid=${state.externalPid}`);
+  } else if (state.sshProcess?.pid) {
+    lines.push(`pid: ${state.sshProcess.pid}`);
+  }
+  if (state.lastError) {
+    lines.push(`error: ${state.lastError}`);
+  }
+
+  return lines.join('\n');
+}
+
+async function getReverseTunnelViewModel(): Promise<ReverseTunnelViewModel> {
+  let config: RuntimeProxyConfig;
+  try {
+    config = getConfig();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      stateLabel: 'Config Error',
+      detail: message,
+      tone: 'failed',
+      actions: getReverseTunnelActions(),
+      issue: message,
+      rows: []
+    };
+  }
+
+  const rows: ReverseTunnelViewRow[] = config.remotes.map((remote) => {
+    const state = getOrCreateRemoteTunnelState(remote.key);
+    const isManagedStarted = state.state === 'connected' || state.state === 'starting';
+    const action: ReverseTunnelViewRow['action'] = state.state === 'stopped' || state.state === 'failed' ? 'start' : isManagedStarted ? 'stop' : 'none';
+    const actionLabel = action === 'start' ? 'Start' : action === 'stop' ? 'Stop' : '-';
+    return {
+      key: remote.key,
+      hostLabel: remote.hostLabel,
+      targetLabel: remote.remoteTarget,
+      bindLabel: String(remote.remoteBindPort),
+      stateLabel: getStateLabel(state.state),
+      tone: getReverseTunnelTone(state.state),
+      tooltip: formatRemoteTunnelTooltip(remote, state),
+      action,
+      actionLabel,
+      actionEnabled: action !== 'none' && state.state !== 'starting'
+    };
+  });
+
+  const aggregateState = getReverseTunnelAggregateState(rows);
+  const startedCount = rows.filter((row) => row.tone === 'connected' || row.tone === 'external').length;
+  return {
+    stateLabel: `${startedCount}/${rows.length} Started`,
+    detail: `${rows.length} reverse tunnel remote${rows.length === 1 ? '' : 's'} configured.`,
+    tone: getReverseTunnelTone(aggregateState),
+    actions: getReverseTunnelActions(),
+    issue: null,
+    rows
+  };
 }
 
 function getKeyProjectStateLabel(status: Pick<KeyProjectStatus, 'clean' | 'available'>): string {
@@ -326,12 +461,7 @@ async function getKeyProjectsViewModel(): Promise<KeyProjectsViewModel> {
 
 async function getToolBoxViewModel(): Promise<ToolBoxViewModel> {
   return {
-    reverseTunnel: {
-      stateLabel: getStateLabel(proxyState),
-      detail: getReverseTunnelDetail(proxyState),
-      tone: getReverseTunnelTone(proxyState),
-      actions: getReverseTunnelActions()
-    },
+    reverseTunnel: await getReverseTunnelViewModel(),
     keyProjects: await getKeyProjectsViewModel()
   };
 }
@@ -345,18 +475,39 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+function escapeHtmlAttribute(value: string): string {
+  return escapeHtml(value).replace(/\r?\n/g, '&#10;');
+}
+
 function createNonce(): string {
   return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 }
 
 function getReverseTunnelActionIconSvg(actionId: string): string {
-  if (actionId === 'toggle') {
-    return '<svg viewBox="0 0 16 16" fill="currentColor" focusable="false" aria-hidden="true"><path d="M7.5 1v7h1V1z"/><path d="M3 8.812a5 5 0 0 1 2.578-4.375l-.485-.874A6 6 0 1 0 11 3.616l-.501.865A5 5 0 1 1 3 8.812"/></svg>';
-  }
   if (actionId === 'logs') {
     return '<svg viewBox="0 0 16 16" fill="currentColor" focusable="false" aria-hidden="true"><path d="M5 10.5a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 0 1h-2a.5.5 0 0 1-.5-.5m0-2a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5m0-2a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5m0-2a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5"/><path d="M3 0h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2v-1h1v1a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v1H1V2a2 2 0 0 1 2-2"/><path d="M1 5v-.5a.5.5 0 0 1 1 0V5h.5a.5.5 0 0 1 0 1h-2a.5.5 0 0 1 0-1zm0 3v-.5a.5.5 0 0 1 1 0V8h.5a.5.5 0 0 1 0 1h-2a.5.5 0 0 1 0-1zm0 3v-.5a.5.5 0 0 1 1 0v.5h.5a.5.5 0 0 1 0 1h-2a.5.5 0 0 1 0-1z"/></svg>';
   }
   return '<svg viewBox="0 0 16 16" fill="currentColor" focusable="false" aria-hidden="true"><path d="M7.068.727c.243-.97 1.62-.97 1.864 0l.071.286a.96.96 0 0 0 1.622.434l.205-.211c.695-.719 1.888-.03 1.613.931l-.08.284a.96.96 0 0 0 1.187 1.187l.283-.081c.96-.275 1.65.918.931 1.613l-.211.205a.96.96 0 0 0 .434 1.622l.286.071c.97.243.97 1.62 0 1.864l-.286.071a.96.96 0 0 0-.434 1.622l.211.205c.719.695.03 1.888-.931 1.613l-.284-.08a.96.96 0 0 0-1.187 1.187l.081.283c.275.96-.918 1.65-1.613.931l-.205-.211a.96.96 0 0 0-1.622.434l-.071.286c-.243.97-1.62.97-1.864 0l-.071-.286a.96.96 0 0 0-1.622-.434l-.205.211c-.695.719-1.888.03-1.613-.931l.08-.284a.96.96 0 0 0-1.186-1.187l-.284.081c-.96.275-1.65-.918-.931-1.613l.211-.205a.96.96 0 0 0-.434-1.622l-.286-.071c-.97-.243-.97-1.62 0-1.864l.286-.071a.96.96 0 0 0 .434-1.622l-.211-.205c-.719-.695-.03-1.888.931-1.613l.284.08a.96.96 0 0 0 1.187-1.186l-.081-.284c-.275-.96.918-1.65 1.613-.931l.205.211a.96.96 0 0 0 1.622-.434zM12.973 8.5H8.25l-2.834 3.779A4.998 4.998 0 0 0 12.973 8.5m0-1a4.998 4.998 0 0 0-7.557-3.779l2.834 3.78zM5.048 3.967l-.087.065zm-.431.355A4.98 4.98 0 0 0 3.002 8c0 1.455.622 2.765 1.615 3.678L7.375 8zm.344 7.646.087.065z"/></svg>';
+}
+
+function getReverseTunnelStateIconSvg(tone: ReverseTunnelViewRow['tone']): string {
+  if (tone === 'connected') {
+    return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" focusable="false" aria-hidden="true"><path d="M8 1.75v6"/><path d="M4.7 4.55a5 5 0 1 0 6.6 0"/></svg>';
+  }
+  if (tone === 'external') {
+    return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" focusable="false" aria-hidden="true"><path d="M8 1.8v5.2"/><path d="M4.7 4.9a4.8 4.8 0 1 0 6.6 0"/><path d="M2.6 8.8 1.4 10a2 2 0 0 0 2.8 2.8l1.1-1.1"/><path d="M10.7 4.3 11.8 3.2A2 2 0 0 1 14.6 6l-1.2 1.2"/></svg>';
+  }
+  if (tone === 'starting') {
+    return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" focusable="false" aria-hidden="true"><path d="M13.2 8a5.2 5.2 0 0 1-8.9 3.7"/><path d="M2.8 8a5.2 5.2 0 0 1 8.9-3.7"/><path d="M11.7 1.9v2.4H9.3"/><path d="M4.3 14.1v-2.4h2.4"/></svg>';
+  }
+  if (tone === 'failed') {
+    return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" focusable="false" aria-hidden="true"><path d="M8 1.9 14.4 13a1 1 0 0 1-.9 1.5h-11a1 1 0 0 1-.9-1.5z"/><path d="M8 5.8v3.2"/><path d="M8 12h.01"/></svg>';
+  }
+  return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" focusable="false" aria-hidden="true"><path d="M8 1.75v6"/><path d="M4.7 4.55a5 5 0 1 0 6.6 0"/><path d="M3 13 13 3"/></svg>';
+}
+
+function getInfoIconSvg(): string {
+  return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" focusable="false" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 7.4v3.6"/><path d="M8 5h.01"/></svg>';
 }
 
 function getKeyProjectsToolbarIconSvg(actionId: string): string {
@@ -370,13 +521,37 @@ function renderToolBoxWebview(webview: vscode.Webview, model: ToolBoxViewModel):
   const reverseActions = model.reverseTunnel.actions
     .map((action) => {
       const classes = ['action'];
-      if (action.id === 'toggle') {
-        classes.push(proxyState === 'connected' ? 'danger' : 'success');
-      }
       const icon = getReverseTunnelActionIconSvg(action.id);
       return '<button class="' + classes.join(' ') + '" data-action="' + escapeHtml(action.id) + '" title="' + escapeHtml(action.label) + '" aria-label="' + escapeHtml(action.label) + '" ' + (action.enabled ? '' : 'disabled') + '><span class="action-icon" aria-hidden="true">' + icon + '</span></button>';
     })
     .join('');
+
+  const reverseRows = model.reverseTunnel.rows
+    .map((row) => {
+      const stateIcon = getReverseTunnelStateIconSvg(row.tone);
+      const infoIcon = getInfoIconSvg();
+      const tooltip = escapeHtmlAttribute(row.tooltip);
+      const actionButton =
+        row.action === 'none'
+          ? '<span class="rt-action-empty">-</span>'
+          : '<button class="rt-action-button ' + escapeHtml(row.action) + '" data-remote-action="' + escapeHtml(row.action) + '" data-remote-key="' + escapeHtml(row.key) + '" title="' + escapeHtml(row.actionLabel + ' ' + row.targetLabel) + '" ' + (row.actionEnabled ? '' : 'disabled') + '>' + escapeHtml(row.actionLabel) + '</button>';
+      return [
+        '<div class="rt-row">',
+        '  <span class="rt-cell rt-host"><code class="rt-host-code">' + escapeHtml(row.hostLabel) + '</code></span>',
+        '  <span class="rt-cell rt-state" title="' + escapeHtml(row.stateLabel) + '" aria-label="' + escapeHtml(row.stateLabel) + '"><span class="rt-state-icon ' + escapeHtml(row.tone) + '">' + stateIcon + '</span><span class="rt-info-icon" data-tooltip="' + tooltip + '" aria-label="Tunnel details">' + infoIcon + '</span></span>',
+        '  <span class="rt-cell rt-action">' + actionButton + '</span>',
+        '</div>'
+      ].join('');
+    })
+    .join('');
+
+  const reverseBody = model.reverseTunnel.issue
+    ? '<div class="empty">' + escapeHtml(model.reverseTunnel.issue) + '</div>'
+    : [
+        '<div class="rt-table">',
+        '  <div class="rt-rows">' + reverseRows + '</div>',
+        '</div>'
+      ].join('');
 
   const keyToolbar = [
     '<button id="refresh" class="icon-button" title="' + escapeHtml(model.keyProjects.refreshing ? 'Refreshing...' : 'Refresh') + '" aria-label="' + escapeHtml(model.keyProjects.refreshing ? 'Refreshing...' : 'Refresh') + '" ' + (model.keyProjects.refreshing ? 'disabled' : '') + '><span class="action-icon" aria-hidden="true">' + getKeyProjectsToolbarIconSvg('refresh') + '</span></button>',
@@ -458,10 +633,10 @@ function renderToolBoxWebview(webview: vscode.Webview, model: ToolBoxViewModel):
       text-align: left;
     }
     .reverse-panel {
-      width: 102px;
+      width: 100%;
       justify-self: start;
       margin-left: 0;
-      padding: 7px 12px 12px;
+      overflow: visible;
     }
     .key-block {
       display: grid;
@@ -513,32 +688,161 @@ function renderToolBoxWebview(webview: vscode.Webview, model: ToolBoxViewModel):
       flex: 0 0 auto;
     }
     .tone.connected, .dot.clean { background: var(--vscode-testing-iconPassed); }
+    .tone.external { background: color-mix(in srgb, var(--vscode-testing-iconPassed) 62%, var(--vscode-descriptionForeground)); }
     .tone.starting { background: var(--vscode-testing-iconQueued); }
     .tone.failed, .dot.dirty { background: var(--vscode-testing-iconFailed); }
     .tone.stopped, .dot.unavailable { background: var(--vscode-disabledForeground); }
-    .reverse-bar {
-      width: 102px;
-      display: grid;
-      gap: 12px;
-      align-items: center;
-      justify-items: stretch;
-      margin-top: 0;
-    }
-    .reverse-status {
-      display: inline-flex;
-      align-items: center;
+    .reverse-toolbar {
+      display: flex;
       gap: 8px;
-      min-width: 0;
-      font-size: 13px;
-      font-weight: 600;
-      line-height: 1.1;
-      margin-top: 0;
-      justify-self: center;
+      padding: 12px 12px 10px;
     }
-    .reverse-status-text {
+    .rt-table {
+      padding: 0 12px 12px;
+    }
+    .rt-row {
+      display: grid;
+      grid-template-columns: minmax(92px, 1fr) 48px 54px;
+      gap: 8px;
+      align-items: center;
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 30px;
+      padding: 7px 4px;
+    }
+    .rt-row {
+      border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 65%, transparent);
+    }
+    .rt-row:last-child {
+      border-bottom: 0;
+    }
+    .rt-cell {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .rt-host {
       display: inline-flex;
       align-items: center;
-      transform: translateY(0.5px);
+    }
+    .rt-host-code {
+      min-width: 0;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      box-sizing: border-box;
+      padding: 2px 5px;
+      border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 82%, transparent);
+      border-radius: 4px;
+      background: var(--vscode-textCodeBlock-background, color-mix(in srgb, var(--vscode-editor-background) 76%, var(--vscode-foreground) 6%));
+      color: var(--vscode-textPreformat-foreground, var(--vscode-foreground));
+      font-family: var(--vscode-editor-font-family, var(--vscode-font-family));
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    .rt-state {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      justify-content: flex-start;
+    }
+    .rt-state-icon,
+    .rt-info-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      flex: 0 0 auto;
+    }
+    .rt-state-icon svg,
+    .rt-info-icon svg {
+      width: 15px;
+      height: 15px;
+      display: block;
+    }
+    .rt-state-icon.connected { color: var(--vscode-testing-iconPassed); }
+    .rt-state-icon.external { color: color-mix(in srgb, var(--vscode-testing-iconPassed) 62%, var(--vscode-descriptionForeground)); }
+    .rt-state-icon.starting { color: var(--vscode-testing-iconQueued); }
+    .rt-state-icon.failed { color: var(--vscode-testing-iconFailed); }
+    .rt-state-icon.stopped { color: var(--vscode-disabledForeground); }
+    .rt-info-icon {
+      color: var(--vscode-descriptionForeground);
+      opacity: 0.86;
+      position: relative;
+      cursor: help;
+    }
+    .rt-info-icon:hover,
+    .rt-info-icon:focus {
+      opacity: 1;
+      color: var(--vscode-foreground);
+    }
+    .rt-info-icon:hover::after,
+    .rt-info-icon:focus::after {
+      content: attr(data-tooltip);
+      position: absolute;
+      z-index: 50;
+      top: calc(100% + 7px);
+      right: -8px;
+      width: min(280px, calc(100vw - 32px));
+      box-sizing: border-box;
+      padding: 9px 10px;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 6px;
+      background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+      color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+      box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-family: var(--vscode-editor-font-family, var(--vscode-font-family));
+      font-size: 11px;
+      line-height: 1.45;
+      text-align: left;
+      pointer-events: none;
+    }
+    .rt-info-icon:hover::before,
+    .rt-info-icon:focus::before {
+      content: '';
+      position: absolute;
+      z-index: 51;
+      top: calc(100% + 2px);
+      right: 4px;
+      border: 5px solid transparent;
+      border-bottom-color: var(--vscode-panel-border);
+      pointer-events: none;
+    }
+    .rt-action {
+      display: inline-flex;
+      justify-content: flex-start;
+    }
+    .rt-action-button {
+      border: 1px solid var(--vscode-button-border, transparent);
+      border-radius: 6px;
+      height: 24px;
+      min-width: 48px;
+      padding: 0 8px;
+      background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+      color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+      cursor: pointer;
+      font: inherit;
+    }
+    .rt-action-button.start {
+      color: var(--vscode-testing-iconPassed);
+    }
+    .rt-action-button.stop {
+      color: var(--vscode-testing-iconFailed);
+    }
+    .rt-action-button:disabled {
+      cursor: default;
+      opacity: 0.6;
+    }
+    .rt-action-empty {
+      color: var(--vscode-descriptionForeground);
+      display: inline-flex;
+      width: 48px;
+      justify-content: center;
     }
     .actions {
       display: inline-flex;
@@ -761,10 +1065,8 @@ function renderToolBoxWebview(webview: vscode.Webview, model: ToolBoxViewModel):
     <section class="reverse-block">
       <div class="eyebrow reverse-title">Reverse Tunnel</div>
       <div class="panel reverse-panel">
-        <div class="reverse-bar">
-          <div class="actions">${reverseActions}</div>
-          <div class="reverse-status"><span class="tone ${model.reverseTunnel.tone}"></span><span class="reverse-status-text">${escapeHtml(model.reverseTunnel.stateLabel)}</span></div>
-        </div>
+        <div class="reverse-toolbar">${reverseActions}</div>
+        ${reverseBody}
       </div>
     </section>
     <section class="key-block">
@@ -797,6 +1099,15 @@ function renderToolBoxWebview(webview: vscode.Webview, model: ToolBoxViewModel):
     });
     document.getElementById('key-settings')?.addEventListener('click', () => {
       vscode.postMessage({ type: 'action', action: 'keySettings' });
+    });
+    document.querySelectorAll('button[data-remote-action][data-remote-key]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const action = button.getAttribute('data-remote-action');
+        const remoteKey = button.getAttribute('data-remote-key');
+        if (action && remoteKey) {
+          vscode.postMessage({ type: 'reverseTunnel', action, remoteKey });
+        }
+      });
     });
     const detailPopover = document.getElementById('detail-popover');
     const detailTitle = document.getElementById('detail-title');
@@ -877,7 +1188,7 @@ class ToolBoxWebviewProvider implements vscode.WebviewViewProvider {
         this.view = null;
       }
     });
-    webviewView.webview.onDidReceiveMessage(async (message: { type?: string; repoName?: string; action?: string; left?: number; top?: number }) => {
+    webviewView.webview.onDidReceiveMessage(async (message: { type?: string; repoName?: string; action?: string; remoteKey?: string; left?: number; top?: number }) => {
       if (message.type === 'showStatus' && message.repoName) {
         const config = await getKeyProjectsConfig();
         const cachedStatus = getCachedKeyProjectStatuses(config)?.find((entry) => entry.configuredRepoName === message.repoName);
@@ -906,12 +1217,16 @@ class ToolBoxWebviewProvider implements vscode.WebviewViewProvider {
         return;
       }
       if (message.type !== 'action' || !message.action) {
+        if (message.type === 'reverseTunnel' && message.action && message.remoteKey) {
+          if (message.action === 'start') {
+            await startRemoteTunnel(message.remoteKey);
+          } else if (message.action === 'stop') {
+            stopRemoteTunnel(message.remoteKey);
+          }
+        }
         return;
       }
       switch (message.action) {
-        case 'toggle':
-          await toggleProxyFromSidebar();
-          return;
         case 'logs':
           showLogs();
           return;
@@ -942,42 +1257,97 @@ class ToolBoxWebviewProvider implements vscode.WebviewViewProvider {
 }
 
 
-function setProxyState(state: ProxyState): void {
-  proxyState = state;
-
-  if (state === 'starting') {
-    statusBarItem.text = '🟡 ReverseTun (Starting)';
-    statusBarItem.tooltip = 'SSH reverse proxy is starting. Click to view status.';
-  } else if (state === 'connected') {
-    statusBarItem.text = '🟢 ReverseTun (Connected)';
-    statusBarItem.tooltip = 'SSH reverse proxy is connected. Click to view status.';
-  } else if (state === 'failed') {
-    statusBarItem.text = '🔴 ReverseTun (Failed)';
-    statusBarItem.tooltip = 'SSH reverse proxy failed. Click to view status.';
-  } else {
-    statusBarItem.text = '🔴 ReverseTun (Stopped)';
-    statusBarItem.tooltip = 'SSH reverse proxy is stopped. Click to view status.';
-  }
-
+function setRemoteTunnelState(remoteKey: string, state: ProxyState): void {
+  const remoteState = getOrCreateRemoteTunnelState(remoteKey);
+  remoteState.state = state;
+  updateReverseTunnelStatusBar();
   void toolBoxWebviewProvider?.refresh();
 }
 
+function updateReverseTunnelStatusBar(): void {
+  if (!statusBarItem) {
+    return;
+  }
+
+  let config: RuntimeProxyConfig | null = null;
+  try {
+    config = getConfig();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    statusBarItem.text = '$(error) ReverseTun setup';
+    statusBarItem.tooltip = message;
+    statusBarItem.show();
+    return;
+  }
+
+  const states = config.remotes.map((remote) => getOrCreateRemoteTunnelState(remote.key));
+  const startedCount = states.filter((state) => state.state === 'connected' || state.state === 'external').length;
+  const hasFailed = states.some((state) => state.state === 'failed');
+  const hasStarting = states.some((state) => state.state === 'starting');
+  const icon = hasFailed ? '$(error)' : hasStarting ? '$(sync~spin)' : startedCount > 0 ? '$(check)' : '$(circle-slash)';
+  statusBarItem.text = `${icon} ReverseTun ${startedCount}/${config.remotes.length}`;
+  statusBarItem.tooltip = config.remotes
+    .map((remote) => {
+      const state = getOrCreateRemoteTunnelState(remote.key);
+      return `${remote.hostLabel}: ${getStateLabel(state.state)}`;
+    })
+    .join('\n');
+  statusBarItem.show();
+}
+
 function getReverseTunnelSidebarItemsForTest(): SidebarTestItem[] {
-  const toggleLabel = proxyState === 'connected'
-    ? 'ReverseTun: ON'
-    : proxyState === 'starting'
-      ? 'ReverseTun: CONNECTING...'
-      : 'ReverseTun: OFF';
-  const toggleCommand = proxyState === 'starting' ? undefined : 'reverseProxy.sidebarToggle';
+  let config: RuntimeProxyConfig;
+  try {
+    config = getConfig();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return [
+      {
+        kind: 'info',
+        label: message,
+        tooltip: message,
+        enabled: false,
+        parentLabel: 'ReverseTunnel'
+      },
+      {
+        kind: 'action',
+        label: 'Open Logs',
+        command: 'reverseProxy.showLogs',
+        enabled: true,
+        parentLabel: 'ReverseTunnel'
+      },
+      {
+        kind: 'action',
+        label: 'Settings',
+        command: 'reverseProxy.openSettings',
+        enabled: true,
+        parentLabel: 'ReverseTunnel'
+      }
+    ];
+  }
+
+  const remoteItems = config.remotes.map((remote) => {
+    const state = getOrCreateRemoteTunnelState(remote.key);
+    const isManagedStarted = state.state === 'connected' || state.state === 'starting';
+    const command = state.state === 'stopped' || state.state === 'failed'
+      ? 'reverseProxy.test.startRemoteTunnel'
+      : isManagedStarted
+        ? 'reverseProxy.test.stopRemoteTunnel'
+        : undefined;
+    return {
+      kind: 'remote',
+      label: `${remote.hostLabel}: ${getStateLabel(state.state)}`,
+      description: state.state === 'external' ? 'external' : undefined,
+      tooltip: formatRemoteTunnelTooltip(remote, state),
+      command,
+      arguments: command ? [remote.key] : undefined,
+      enabled: Boolean(command) && state.state !== 'starting',
+      parentLabel: 'ReverseTunnel'
+    };
+  });
 
   return [
-    {
-      kind: 'action',
-      label: toggleLabel,
-      command: toggleCommand,
-      enabled: Boolean(toggleCommand),
-      parentLabel: 'ReverseTunnel'
-    },
+    ...remoteItems,
     {
       kind: 'action',
       label: 'Open Logs',
@@ -1116,6 +1486,13 @@ function assertNumber(value: unknown, key: string): number {
     throw new Error(`Invalid config field '${key}': expected number.`);
   }
   return value;
+}
+
+function assertObject(value: unknown, key: string): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Invalid config field '${key}': expected object.`);
+  }
+  return value as Record<string, unknown>;
 }
 
 function assertStringArray(value: unknown, key: string): string[] {
@@ -2097,22 +2474,43 @@ function loadFileProxyConfig(filePath: string): FileProxyConfig {
   }
 
   const data = section as Record<string, unknown>;
-  const identityFile = typeof data.identityFile === 'string' ? data.identityFile.trim() : '';
   const connectionReadyDelayMs = assertNumber(data.connectionReadyDelayMs, 'ReverseTunnel.connectionReadyDelayMs');
   if (connectionReadyDelayMs <= 0) {
     throw new Error(`Invalid config field 'ReverseTunnel.connectionReadyDelayMs': expected > 0.`);
   }
 
+  if (!Array.isArray(data.remotes)) {
+    throw new Error(`Invalid config field 'ReverseTunnel.remotes': expected remote config array.`);
+  }
+
+  const seenRemoteKeys = new Set<string>();
+  const remotes = data.remotes.map((entry, index) => {
+    const remoteData = assertObject(entry, `ReverseTunnel.remotes[${index}]`);
+    const remote: RemoteProxyConfig = {
+      remoteHost: assertString(remoteData.remoteHost, `ReverseTunnel.remotes[${index}].remoteHost`),
+      remotePort: assertNumber(remoteData.remotePort, `ReverseTunnel.remotes[${index}].remotePort`),
+      remoteUser: assertString(remoteData.remoteUser, `ReverseTunnel.remotes[${index}].remoteUser`),
+      remoteBindPort: assertNumber(remoteData.remoteBindPort, `ReverseTunnel.remotes[${index}].remoteBindPort`),
+      identityFile: typeof remoteData.identityFile === 'string' ? remoteData.identityFile.trim() : ''
+    };
+    const key = getRemoteKey(remote);
+    if (seenRemoteKeys.has(key)) {
+      throw new Error(`Invalid config field 'ReverseTunnel.remotes[${index}]': duplicate remote '${key}'.`);
+    }
+    seenRemoteKeys.add(key);
+    return remote;
+  });
+
+  if (remotes.length === 0) {
+    throw new Error(`Invalid config field 'ReverseTunnel.remotes': expected at least one remote.`);
+  }
+
   return {
     sshPath: assertString(data.sshPath, 'ReverseTunnel.sshPath'),
     connectionReadyDelayMs,
-    remoteHost: assertString(data.remoteHost, 'ReverseTunnel.remoteHost'),
-    remotePort: assertNumber(data.remotePort, 'ReverseTunnel.remotePort'),
-    remoteUser: assertString(data.remoteUser, 'ReverseTunnel.remoteUser'),
-    remoteBindPort: assertNumber(data.remoteBindPort, 'ReverseTunnel.remoteBindPort'),
     localHost: assertString(data.localHost, 'ReverseTunnel.localHost'),
     localPort: assertNumber(data.localPort, 'ReverseTunnel.localPort'),
-    identityFile
+    remotes
   };
 }
 
@@ -2123,8 +2521,18 @@ function getConfig(): RuntimeProxyConfig {
   const fileConfig = loadFileProxyConfig(configPath);
 
   return {
-    ...fileConfig,
-    loadedConfigPath: configPath
+    sshPath: fileConfig.sshPath,
+    connectionReadyDelayMs: fileConfig.connectionReadyDelayMs,
+    localHost: fileConfig.localHost,
+    localPort: fileConfig.localPort,
+    loadedConfigPath: configPath,
+    remotes: fileConfig.remotes.map((remote) => ({
+      ...remote,
+      key: getRemoteKey(remote),
+      hostLabel: `${remote.remoteHost}:${remote.remotePort}`,
+      remoteTarget: `${remote.remoteUser}@${remote.remoteHost}`,
+      reverseSpec: `${remote.remoteBindPort}:${fileConfig.localHost}:${fileConfig.localPort}`
+    }))
   };
 }
 
@@ -2166,15 +2574,13 @@ function commandLineHasArg(commandLine: string, value: string): boolean {
   return pattern.test(commandLine);
 }
 
-function isMatchingTunnelCommand(commandLine: string, config: RuntimeProxyConfig): boolean {
+function isMatchingTunnelCommand(commandLine: string, remote: RuntimeRemoteProxyConfig): boolean {
   const normalized = normalizeCommandLine(commandLine);
   if (!normalized) {
     return false;
   }
 
-  const reverseSpec = `${config.remoteBindPort}:${config.localHost}:${config.localPort}`;
-  const reverseSpecLower = reverseSpec.toLowerCase();
-  const remoteTarget = `${config.remoteUser}@${config.remoteHost}`;
+  const reverseSpecLower = remote.reverseSpec.toLowerCase();
   const normalizedLower = normalized.toLowerCase();
 
   const hasReverseFlag = /(^|\s)-R(?=\s|$)/i.test(normalized);
@@ -2184,9 +2590,8 @@ function isMatchingTunnelCommand(commandLine: string, config: RuntimeProxyConfig
   }
 
   const hasRemoteTarget =
-    commandLineHasArg(normalized, remoteTarget) ||
-    commandLineHasArg(normalized, config.remoteHost) ||
-    commandLineHasArg(normalized, config.remoteUser);
+    commandLineHasArg(normalized, remote.remoteTarget) ||
+    (commandLineHasArg(normalized, remote.remoteHost) && commandLineHasArg(normalized, remote.remoteUser));
 
   if (!hasRemoteTarget) {
     return false;
@@ -2294,18 +2699,19 @@ function listCandidateProcesses(): Promise<ExistingTunnelMatch[]> {
   });
 }
 
-async function findExistingTunnelProcess(config: RuntimeProxyConfig): Promise<ExistingTunnelMatch | null> {
-  const processes = await listCandidateProcesses();
+async function findExistingTunnelProcess(remote: RuntimeRemoteProxyConfig, processes?: ExistingTunnelMatch[]): Promise<ExistingTunnelMatch | null> {
+  const candidates = processes ?? (await listCandidateProcesses());
   const currentPid = process.pid;
+  const state = getOrCreateRemoteTunnelState(remote.key);
 
-  for (const candidate of processes) {
+  for (const candidate of candidates) {
     if (candidate.pid === currentPid) {
       continue;
     }
-    if (sshProcess?.pid && candidate.pid === sshProcess.pid) {
+    if (state.sshProcess?.pid && candidate.pid === state.sshProcess.pid) {
       return candidate;
     }
-    if (isMatchingTunnelCommand(candidate.commandLine, config)) {
+    if (isMatchingTunnelCommand(candidate.commandLine, remote)) {
       return candidate;
     }
   }
@@ -2324,21 +2730,31 @@ async function syncProxyStateFromSystem(config?: RuntimeProxyConfig): Promise<bo
   }
 
   try {
-    const existing = await findExistingTunnelProcess(runtimeConfig);
-    if (!existing) {
-      externalTunnelPid = null;
-      if (!sshProcess && proxyState === 'connected') {
-        setProxyState('stopped');
+    const processes = await listCandidateProcesses();
+    let foundAny = false;
+    for (const remote of runtimeConfig.remotes) {
+      const state = getOrCreateRemoteTunnelState(remote.key);
+      const existing = await findExistingTunnelProcess(remote, processes);
+      if (!existing) {
+        state.externalPid = null;
+        if (!state.sshProcess && (state.state === 'connected' || state.state === 'external')) {
+          setRemoteTunnelState(remote.key, 'stopped');
+        }
+        continue;
       }
-      return false;
-    }
 
-    externalTunnelPid = sshProcess?.pid === existing.pid ? null : existing.pid;
-    if (proxyState !== 'connected') {
-      outputChannel.appendLine(`[sync] detected existing reverse tunnel process pid=${existing.pid}`);
-      setProxyState('connected');
+      foundAny = true;
+      if (state.sshProcess?.pid === existing.pid) {
+        state.externalPid = null;
+      } else {
+        state.externalPid = existing.pid;
+        if (state.state !== 'external') {
+          outputChannel.appendLine(`[sync] detected external reverse tunnel remote=${remote.key} pid=${existing.pid}`);
+          setRemoteTunnelState(remote.key, 'external');
+        }
+      }
     }
-    return true;
+    return foundAny;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     outputChannel.appendLine(`[warn] unable to inspect existing tunnel processes: ${message}`);
@@ -2346,43 +2762,62 @@ async function syncProxyStateFromSystem(config?: RuntimeProxyConfig): Promise<bo
   }
 }
 
-async function startProxy(): Promise<void> {
-  if (sshProcess) {
-    vscode.window.showInformationMessage('Reverse proxy is already running.');
-    return;
-  }
+function getRuntimeRemote(config: RuntimeProxyConfig, remoteKey: string): RuntimeRemoteProxyConfig | null {
+  return config.remotes.find((remote) => remote.key === remoteKey) ?? null;
+}
 
+async function startRemoteTunnel(remoteKey: string): Promise<void> {
   let config: RuntimeProxyConfig;
   try {
     config = getConfig();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     outputChannel.appendLine(`[error] ${message}`);
-    setProxyState('failed');
     vscode.window.showErrorMessage(`Failed to load reverse proxy config: ${message}`);
     return;
   }
 
-  const remoteTarget = `${config.remoteUser}@${config.remoteHost}`;
-  const reverseSpec = `${config.remoteBindPort}:${config.localHost}:${config.localPort}`;
+  const remote = getRuntimeRemote(config, remoteKey);
+  if (!remote) {
+    vscode.window.showErrorMessage(`Reverse tunnel remote not found: ${remoteKey}`);
+    return;
+  }
+
+  const state = getOrCreateRemoteTunnelState(remote.key);
+  if (state.sshProcess || state.state === 'starting' || state.state === 'connected') {
+    vscode.window.showInformationMessage(`Reverse tunnel is already started: ${remote.hostLabel}`);
+    return;
+  }
+  if (state.state === 'external') {
+    vscode.window.showInformationMessage(`Reverse tunnel is already started externally: ${remote.hostLabel}`);
+    return;
+  }
+
   outputChannel.appendLine(`[config] using file: ${config.loadedConfigPath}`);
   if (vscode.env.remoteName) {
     outputChannel.appendLine(`[mode] workspace is remote (${vscode.env.remoteName}), tunnel runs on local UI host.`);
   }
 
-  if (await syncProxyStateFromSystem(config)) {
-    vscode.window.showInformationMessage('Reverse proxy is already running in another VS Code window.');
+  await syncProxyStateFromSystem(config);
+  const syncedState = getOrCreateRemoteTunnelState(remote.key);
+  if (syncedState.state === 'external') {
+    vscode.window.showInformationMessage(`Reverse tunnel is already started externally: ${remote.hostLabel}`);
     return;
   }
 
-  setProxyState('starting');
+  setRemoteTunnelState(remote.key, 'starting');
+  state.lastError = null;
+  state.stopRequested = false;
+  state.externalPid = null;
+  state.stderrLogState = createSshStderrLogState();
 
   try {
     await verifySshExists(config.sshPath);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     outputChannel.appendLine(`[error] ${message}`);
-    setProxyState('failed');
+    state.lastError = message;
+    setRemoteTunnelState(remote.key, 'failed');
     vscode.window.showErrorMessage(
       `SSH command is unavailable. Install OpenSSH or update 'sshPath' in reverse-proxy.config.json. Details: ${message}`
     );
@@ -2392,7 +2827,7 @@ async function startProxy(): Promise<void> {
   const args = [
     '-N',
     '-p',
-    String(config.remotePort),
+    String(remote.remotePort),
     '-o',
     'ExitOnForwardFailure=yes',
     '-o',
@@ -2400,59 +2835,56 @@ async function startProxy(): Promise<void> {
     '-o',
     'ServerAliveCountMax=3',
     '-R',
-    reverseSpec
+    remote.reverseSpec
   ];
 
-  if (config.identityFile.length > 0) {
-    args.push('-i', config.identityFile);
+  if (remote.identityFile.length > 0) {
+    args.push('-i', remote.identityFile);
   }
 
-  args.push(remoteTarget);
+  args.push(remote.remoteTarget);
 
   outputChannel.appendLine(`[start] ${config.sshPath} ${args.join(' ')}`);
 
   try {
-    sshProcess = spawn(config.sshPath, args);
+    state.sshProcess = spawn(config.sshPath, args);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    outputChannel.appendLine(`[error] failed to spawn ssh: ${message}`);
-    vscode.window.showErrorMessage(`Failed to start reverse proxy: ${message}`);
-    sshProcess = null;
+    state.lastError = message;
+    outputChannel.appendLine(`[error] failed to spawn ssh remote=${remote.key}: ${message}`);
+    vscode.window.showErrorMessage(`Failed to start reverse tunnel ${remote.hostLabel}: ${message}`);
+    state.sshProcess = null;
+    setRemoteTunnelState(remote.key, 'failed');
     return;
   }
 
-  stopRequested = false;
-  externalTunnelPid = null;
   let hasFailed = false;
-  const stderrLogState: SshStderrLogState = {
-    lastLocalTargetConnectFailureLogAt: new Map<string, number>(),
-    localTargetConnectFailureContextUntilMs: 0
-  };
   const markFailed = (message: string): void => {
     if (hasFailed) {
       return;
     }
     hasFailed = true;
+    state.lastError = message;
     outputChannel.appendLine(`[error] ${message}`);
-    setProxyState('failed');
+    setRemoteTunnelState(remote.key, 'failed');
     vscode.window.showErrorMessage(message);
   };
 
-  if (connectTimer) {
-    clearTimeout(connectTimer);
+  if (state.connectTimer) {
+    clearTimeout(state.connectTimer);
   }
-  connectTimer = setTimeout(() => {
-    if (sshProcess && !hasFailed && !stopRequested) {
-      setProxyState('connected');
-      vscode.window.showInformationMessage('Reverse proxy connected.');
+  state.connectTimer = setTimeout(() => {
+    if (state.sshProcess && !hasFailed && !state.stopRequested) {
+      setRemoteTunnelState(remote.key, 'connected');
+      vscode.window.showInformationMessage(`Reverse tunnel started: ${remote.hostLabel}`);
     }
   }, config.connectionReadyDelayMs);
 
-  sshProcess.stdout.on('data', (data: Buffer) => {
-    outputChannel.appendLine(`[stdout] ${data.toString().trim()}`);
+  state.sshProcess.stdout.on('data', (data: Buffer) => {
+    outputChannel.appendLine(`[stdout] [${remote.key}] ${data.toString().trim()}`);
   });
 
-  sshProcess.stderr.on('data', (data: Buffer) => {
+  state.sshProcess.stderr.on('data', (data: Buffer) => {
     const lines = data
       .toString()
       .split(/\r?\n/)
@@ -2460,97 +2892,74 @@ async function startProxy(): Promise<void> {
       .filter((line) => line.length > 0);
 
     for (const text of lines) {
-      if (shouldLogSshStderr(text, config, Date.now(), stderrLogState)) {
-        outputChannel.appendLine(`[stderr] ${text}`);
+      if (shouldLogSshStderr(text, config, Date.now(), state.stderrLogState)) {
+        outputChannel.appendLine(`[stderr] [${remote.key}] ${text}`);
       }
     }
 
     const text = lines.join('\n');
     if (/remote port forwarding failed/i.test(text) || /address already in use/i.test(text)) {
-      markFailed(`Reverse proxy failed: remote port ${config.remoteBindPort} is already in use.`);
-      if (sshProcess) {
-        sshProcess.kill();
+      markFailed(`Reverse tunnel failed: remote port ${remote.remoteBindPort} is already in use on ${remote.hostLabel}.`);
+      if (state.sshProcess) {
+        state.sshProcess.kill();
       }
     }
   });
 
-  sshProcess.on('error', (err: Error) => {
-    markFailed(`Reverse proxy failed: ${err.message}`);
+  state.sshProcess.on('error', (err: Error) => {
+    markFailed(`Reverse tunnel failed for ${remote.hostLabel}: ${err.message}`);
   });
 
-  sshProcess.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
-    outputChannel.appendLine(`[stop] ssh exited with code=${code} signal=${signal}`);
-    if (connectTimer) {
-      clearTimeout(connectTimer);
-      connectTimer = null;
+  state.sshProcess.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+    outputChannel.appendLine(`[stop] [${remote.key}] ssh exited with code=${code} signal=${signal}`);
+    if (state.connectTimer) {
+      clearTimeout(state.connectTimer);
+      state.connectTimer = null;
     }
 
-    if (stopRequested) {
-      setProxyState('stopped');
+    state.sshProcess = null;
+    state.externalPid = null;
+    if (state.stopRequested) {
+      setRemoteTunnelState(remote.key, 'stopped');
     } else if (hasFailed) {
       // Keep failed state.
-    } else if (proxyState === 'starting') {
-      markFailed(`Reverse proxy failed before connection established (code=${code}, signal=${signal}).`);
-    } else if (proxyState === 'connected') {
-      markFailed(`Reverse proxy disconnected unexpectedly (code=${code}, signal=${signal}).`);
+    } else if (state.state === 'starting') {
+      markFailed(`Reverse tunnel failed before connection established for ${remote.hostLabel} (code=${code}, signal=${signal}).`);
+    } else if (state.state === 'connected') {
+      markFailed(`Reverse tunnel disconnected unexpectedly for ${remote.hostLabel} (code=${code}, signal=${signal}).`);
     } else {
-      setProxyState('stopped');
+      setRemoteTunnelState(remote.key, 'stopped');
     }
 
-    sshProcess = null;
-    externalTunnelPid = null;
-    stopRequested = false;
+    state.stopRequested = false;
   });
 
   outputChannel.show(true);
 }
 
-function stopProxy(): void {
-  if (!sshProcess && !externalTunnelPid) {
-    vscode.window.showInformationMessage('Reverse proxy is not running.');
+function stopRemoteTunnel(remoteKey: string): void {
+  const state = remoteTunnelStates.get(remoteKey);
+  if (!state || !state.sshProcess) {
+    vscode.window.showInformationMessage(`Reverse tunnel is not managed by this window: ${remoteKey}`);
     return;
   }
 
-  outputChannel.appendLine('[stop] stopping ssh reverse proxy');
-  stopRequested = true;
-  if (connectTimer) {
-    clearTimeout(connectTimer);
-    connectTimer = null;
+  outputChannel.appendLine(`[stop] stopping ssh reverse tunnel remote=${remoteKey}`);
+  state.stopRequested = true;
+  if (state.connectTimer) {
+    clearTimeout(state.connectTimer);
+    state.connectTimer = null;
   }
-  if (sshProcess) {
-    sshProcess.kill();
-    sshProcess = null;
-  } else if (externalTunnelPid) {
-    try {
-      process.kill(externalTunnelPid);
-      outputChannel.appendLine(`[stop] sent termination signal to existing reverse tunnel pid=${externalTunnelPid}`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      outputChannel.appendLine(`[warn] failed to stop existing reverse tunnel pid=${externalTunnelPid}: ${message}`);
-      vscode.window.showErrorMessage(`Failed to stop reverse proxy process ${externalTunnelPid}: ${message}`);
-      return;
-    }
-  }
-  externalTunnelPid = null;
-  setProxyState('stopped');
-  vscode.window.showInformationMessage('Reverse proxy stopping...');
-}
-
-async function toggleProxyFromSidebar(): Promise<void> {
-  if (proxyState === 'starting') {
-    return;
-  }
-
-  if (proxyState === 'connected' || sshProcess || externalTunnelPid) {
-    stopProxy();
-    return;
-  }
-
-  await startProxy();
+  state.sshProcess.kill();
+  state.sshProcess = null;
+  state.externalPid = null;
+  setRemoteTunnelState(remoteKey, 'stopped');
+  vscode.window.showInformationMessage(`Reverse tunnel stopping: ${remoteKey}`);
 }
 
 function showStatus(): void {
-  vscode.window.showInformationMessage(`Reverse proxy status: ${getStateLabel(proxyState)}`);
+  const started = Array.from(remoteTunnelStates.values()).filter((state) => state.state === 'connected' || state.state === 'external').length;
+  vscode.window.showInformationMessage(`Reverse tunnel status: ${started} started remote(s).`);
 }
 
 function showLogs(): void {
@@ -2563,13 +2972,17 @@ function getDefaultConfigJsonContent(): string {
       ReverseTunnel: {
         sshPath: 'ssh',
         connectionReadyDelayMs: 1200,
-        remoteHost: 'FOO_ADDRESS',
-        remotePort: 4001,
-        remoteUser: 'FOO_USER',
-        remoteBindPort: 17897,
         localHost: '127.0.0.1',
         localPort: 7897,
-        identityFile: ''
+        remotes: [
+          {
+            remoteHost: 'FOO_ADDRESS',
+            remotePort: 4001,
+            remoteUser: 'FOO_USER',
+            remoteBindPort: 17897,
+            identityFile: ''
+          }
+        ]
       }
     },
     null,
@@ -2631,7 +3044,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBarItem.command = 'reverseProxy.showStatus';
-  setProxyState('stopped');
+  updateReverseTunnelStatusBar();
   statusBarItem.show();
   toolBoxWebviewProvider = new ToolBoxWebviewProvider();
 
@@ -2676,37 +3089,19 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('reverseProxy.configFile')) {
         void syncProxyStateFromSystem();
-  void updateKeyStatusBar();
+        updateReverseTunnelStatusBar();
       }
       if (event.affectsConfiguration('reverseProxy')) {
         void toolBoxWebviewProvider?.refresh();
-      
+        updateReverseTunnelStatusBar();
       }
       void updateKeyStatusBar();
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('reverseProxy.start', async () => {
-      await startProxy();
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('reverseProxy.stop', () => {
-      stopProxy();
-    })
-  );
-
-  context.subscriptions.push(
     vscode.commands.registerCommand('reverseProxy.showStatus', () => {
       showStatus();
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('reverseProxy.sidebarToggle', async () => {
-      await toggleProxyFromSidebar();
     })
   );
 
@@ -2743,6 +3138,12 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('reverseProxy.test.getToolBoxViewState', async () => {
       return getToolBoxViewModel();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('reverseProxy.test.renderToolBoxHtml', async () => {
+      return renderToolBoxWebview({ cspSource: 'vscode-test-resource' } as vscode.Webview, await getToolBoxViewModel());
     })
   );
 
@@ -2794,10 +3195,40 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('reverseProxy.test.syncStateFromSystem', async () => {
       await syncProxyStateFromSystem();
-      return {
-        state: proxyState,
-        externalTunnelPid
-      };
+      return Array.from(remoteTunnelStates.entries()).map(([remoteKey, state]) => ({
+        remoteKey,
+        state: state.state,
+        externalPid: state.externalPid
+      }));
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('reverseProxy.test.startRemoteTunnel', async (remoteKey: string) => {
+      await startRemoteTunnel(remoteKey);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('reverseProxy.test.stopRemoteTunnel', (remoteKey: string) => {
+      stopRemoteTunnel(remoteKey);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('reverseProxy.test.resetRemoteTunnelStates', () => {
+      for (const state of remoteTunnelStates.values()) {
+        if (state.connectTimer) {
+          clearTimeout(state.connectTimer);
+        }
+        if (state.sshProcess) {
+          state.stopRequested = true;
+          state.sshProcess.kill();
+        }
+      }
+      remoteTunnelStates.clear();
+      updateReverseTunnelStatusBar();
+      void toolBoxWebviewProvider?.refresh();
     })
   );
 
@@ -2876,18 +3307,22 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   toolBoxWebviewProvider = null;
-  externalTunnelPid = null;
   if (keyStatusBarItem) {
     keyStatusBarItem.dispose();
   }
-  if (connectTimer) {
-    clearTimeout(connectTimer);
-    connectTimer = null;
+
+  for (const state of remoteTunnelStates.values()) {
+    if (state.connectTimer) {
+      clearTimeout(state.connectTimer);
+      state.connectTimer = null;
+    }
+    if (state.sshProcess) {
+      state.stopRequested = true;
+      state.sshProcess.kill();
+      state.sshProcess = null;
+    }
   }
-  if (sshProcess) {
-    sshProcess.kill();
-    sshProcess = null;
-  }
+  remoteTunnelStates.clear();
 }
 
 

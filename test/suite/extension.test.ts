@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 
 type SidebarSnapshot = {
   root: Array<{ label: string; command?: string; enabled: boolean; parentLabel?: string; tooltip?: string }>;
@@ -32,6 +33,37 @@ suite('Reverse Proxy Extension Integration Tests', () => {
 
   const writeProxyConfig = (
     remoteBindPort: number,
+    options?: { sshPath?: string; connectionReadyDelayMs?: number; remoteHost?: string; remotePort?: number; remoteUser?: string }
+  ): void => {
+    fs.writeFileSync(
+      testConfigFilePath,
+      JSON.stringify(
+        {
+          ReverseTunnel: {
+            sshPath: options?.sshPath ?? 'ssh',
+            connectionReadyDelayMs: options?.connectionReadyDelayMs ?? 1200,
+            localHost: '127.0.0.1',
+            localPort: 7897,
+            remotes: [
+              {
+                remoteHost: options?.remoteHost ?? '10.99.0.1',
+                remotePort: options?.remotePort ?? 4001,
+                remoteUser: options?.remoteUser ?? 'yangweijian',
+                remoteBindPort,
+                identityFile: ''
+              }
+            ]
+          }
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+  };
+
+  const writeProxyConfigWithRemotes = (
+    remotes: Array<{ remoteHost: string; remotePort: number; remoteUser: string; remoteBindPort: number; identityFile?: string }>,
     options?: { sshPath?: string; connectionReadyDelayMs?: number }
   ): void => {
     fs.writeFileSync(
@@ -41,13 +73,9 @@ suite('Reverse Proxy Extension Integration Tests', () => {
           ReverseTunnel: {
             sshPath: options?.sshPath ?? 'ssh',
             connectionReadyDelayMs: options?.connectionReadyDelayMs ?? 1200,
-            remoteHost: '10.99.0.1',
-            remotePort: 4001,
-            remoteUser: 'yangweijian',
-            remoteBindPort,
             localHost: '127.0.0.1',
             localPort: 7897,
-            identityFile: ''
+            remotes
           }
         },
         null,
@@ -90,6 +118,8 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     const snapshot = await getSidebarSnapshot();
     return snapshot.children.filter((child) => child.parentLabel === parentLabel);
   };
+
+  const getDefaultRemoteKey = () => 'yangweijian@10.99.0.1:4001';
 
   suiteSetup(async () => {
     const extension = vscode.extensions.getExtension('local.reverse-proxy-extension');
@@ -303,17 +333,16 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     await config.update('configFile', originalConfigFile, vscode.ConfigurationTarget.Global);
     delete process.env.RPX_FAKE_MODE;
     delete process.env.RPX_FAKE_BIND_PORT;
-    await vscode.commands.executeCommand('reverseProxy.stop');
   });
 
   test('commands should be registered', async () => {
     const commands = await vscode.commands.getCommands(true);
-    assert.ok(commands.includes('reverseProxy.start'));
-    assert.ok(commands.includes('reverseProxy.stop'));
+    assert.ok(!commands.includes('reverseProxy.start'));
+    assert.ok(!commands.includes('reverseProxy.stop'));
     assert.ok(commands.includes('reverseProxy.showStatus'));
     assert.ok(commands.includes('reverseProxy.showLogs'));
     assert.ok(commands.includes('reverseProxy.openSettings'));
-    assert.ok(commands.includes('reverseProxy.sidebarToggle'));
+    assert.ok(!commands.includes('reverseProxy.sidebarToggle'));
     assert.ok(commands.includes('reverseProxy.openKeyProjectSettings'));
     assert.ok(commands.includes('reverseProxy.refreshKeyProjects'));
     assert.ok(commands.includes('reverseProxy.showKeyProjectStatus'));
@@ -402,7 +431,8 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     const emptyWorkspace = path.join(testDir, 'workspace-empty');
     fs.mkdirSync(emptyWorkspace, { recursive: true });
     await setKeyProjectsWorkspaceOverride(emptyWorkspace);
-    await vscode.commands.executeCommand('reverseProxy.stop');
+    writeProxyConfig(17897, { sshPath: fakeSshPath, connectionReadyDelayMs: 200 });
+    await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
 
     const tree = await getSidebarSnapshot();
     const reverseChildren = tree.children.filter((child) => child.parentLabel === 'ReverseTunnel');
@@ -411,13 +441,110 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     assert.strictEqual(tree.root.length, 2, `Expected two root groups, got ${tree.root.length}`);
     assert.deepStrictEqual(tree.root.map((item) => item.label), ['ReverseTunnel', 'Key Projects']);
     assert.strictEqual(reverseChildren.length, 3, `Expected three reverse tunnel items, got ${reverseChildren.length}`);
-    assert.strictEqual(reverseChildren[0]?.label, 'ReverseTun: OFF');
+    assert.strictEqual(reverseChildren[0]?.label, '10.99.0.1:4001: Stopped');
     assert.strictEqual(reverseChildren[1]?.label, 'Open Logs');
     assert.strictEqual(reverseChildren[2]?.label, 'Settings');
     assert.strictEqual(keyProjectChildren.length, 3, `Expected issue message, refresh, and settings for key projects, got ${keyProjectChildren.length}`);
     assert.ok(keyProjectChildren[0]?.label.includes('.vscode/mytoolbox.json'));
     assert.strictEqual(keyProjectChildren[1]?.label, 'Refresh');
     assert.strictEqual(keyProjectChildren[2]?.label, 'Settings');
+  });
+
+  test('reverse tunnel view should show multiple remotes as host port rows', async () => {
+    writeProxyConfigWithRemotes(
+      [
+        { remoteHost: '10.99.0.1', remotePort: 4001, remoteUser: 'yangweijian', remoteBindPort: 17897, identityFile: '' },
+        { remoteHost: '10.111.90.10', remotePort: 4001, remoteUser: 'foo', remoteBindPort: 17897, identityFile: '' }
+      ],
+      { sshPath: fakeSshPath, connectionReadyDelayMs: 200 }
+    );
+    await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
+
+    const model = (await vscode.commands.executeCommand('reverseProxy.test.getToolBoxViewState')) as {
+      reverseTunnel: { rows: Array<{ hostLabel: string; stateLabel: string; actionLabel: string; tooltip: string }> };
+    };
+
+    assert.deepStrictEqual(
+      model.reverseTunnel.rows.map((row) => `${row.hostLabel}:${row.stateLabel}:${row.actionLabel}`),
+      ['10.99.0.1:4001:Stopped:Start', '10.111.90.10:4001:Stopped:Start']
+    );
+    assert.ok(model.reverseTunnel.rows[0]?.tooltip.includes('target: yangweijian@10.99.0.1'));
+    assert.ok(model.reverseTunnel.rows[1]?.tooltip.includes('target: foo@10.111.90.10'));
+  });
+
+  test('reverse tunnel webview should render compact icon rows without table header', async () => {
+    writeProxyConfigWithRemotes(
+      [
+        { remoteHost: '10.99.0.1', remotePort: 4001, remoteUser: 'yangweijian', remoteBindPort: 17897, identityFile: '' }
+      ],
+      { sshPath: fakeSshPath, connectionReadyDelayMs: 200 }
+    );
+    await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
+
+    const html = (await vscode.commands.executeCommand('reverseProxy.test.renderToolBoxHtml')) as string;
+
+    assert.ok(!html.includes('<span>Host</span>'), 'Reverse tunnel table header should be removed');
+    assert.ok(!html.includes('<span>State</span>'), 'Reverse tunnel table header should be removed');
+    assert.ok(!html.includes('<span>Action</span>'), 'Reverse tunnel table header should be removed');
+    assert.ok(html.includes('class="rt-host-code">10.99.0.1:4001</code>'), 'Host should render with inline-code styling');
+    assert.ok(html.includes('class="rt-state-icon stopped"'), 'Stopped state should render as icon class');
+    assert.ok(html.includes('class="rt-info-icon"'), 'Info icon should be rendered next to state icon');
+    assert.ok(html.includes('data-tooltip="target: yangweijian@10.99.0.1'), 'Info icon should use immediate custom tooltip data');
+    assert.ok(!html.includes('class="rt-info-icon" title='), 'Info icon should not use delayed native title tooltip');
+    assert.ok(html.includes('target: yangweijian@10.99.0.1'), 'Info tooltip should include remote target details');
+    assert.ok(!html.includes('>Stopped</span></span>'), 'State text should not be visible in the state cell');
+  });
+
+  test('reverse tunnel config should reject legacy single remote shape and duplicate remotes', async () => {
+    const errors: string[] = [];
+    const originalShowErrorMessage = win.showErrorMessage;
+
+    win.showErrorMessage = async (message: string) => {
+      errors.push(message);
+      return undefined;
+    };
+
+    try {
+      fs.writeFileSync(
+        testConfigFilePath,
+        JSON.stringify(
+          {
+            ReverseTunnel: {
+              sshPath: 'ssh',
+              connectionReadyDelayMs: 1200,
+              remoteHost: '10.99.0.1',
+              remotePort: 4001,
+              remoteUser: 'yangweijian',
+              remoteBindPort: 17897,
+              localHost: '127.0.0.1',
+              localPort: 7897,
+              identityFile: ''
+            }
+          },
+          null,
+          2
+        ),
+        'utf8'
+      );
+      await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
+      await vscode.commands.executeCommand('reverseProxy.test.startRemoteTunnel', getDefaultRemoteKey());
+      assert.ok(errors.some((message) => message.includes('ReverseTunnel.remotes')), `Expected legacy config error, got: ${errors.join(' | ')}`);
+
+      errors.length = 0;
+      writeProxyConfigWithRemotes(
+        [
+          { remoteHost: '10.99.0.1', remotePort: 4001, remoteUser: 'yangweijian', remoteBindPort: 17897, identityFile: '' },
+          { remoteHost: '10.99.0.1', remotePort: 4001, remoteUser: 'yangweijian', remoteBindPort: 17898, identityFile: '' }
+        ],
+        { sshPath: fakeSshPath }
+      );
+      await vscode.commands.executeCommand('reverseProxy.test.startRemoteTunnel', getDefaultRemoteKey());
+      assert.ok(errors.some((message) => message.includes('duplicate remote')), `Expected duplicate remote error, got: ${errors.join(' | ')}`);
+    } finally {
+      win.showErrorMessage = originalShowErrorMessage;
+      writeProxyConfig(17897);
+      await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
+    }
   });
 
   test('key projects should show local git branch, clean state, tooltip, and click details', async () => {
@@ -591,7 +718,7 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     assert.strictEqual(created.keyProjects?.sshPort, 22);
   });
 
-  test('sidebar single toggle should switch OFF -> ON -> OFF end-to-end', async () => {
+  test('sidebar remote row should switch Stopped -> Started -> Stopped end-to-end', async () => {
     const infos: string[] = [];
     const originalShowInformationMessage = win.showInformationMessage;
 
@@ -604,39 +731,79 @@ suite('Reverse Proxy Extension Integration Tests', () => {
       writeProxyConfig(29103, { sshPath: fakeSshPath, connectionReadyDelayMs: 200 });
       process.env.RPX_FAKE_MODE = 'success';
       await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
+      await vscode.commands.executeCommand('reverseProxy.test.resetRemoteTunnelStates');
 
       await vscode.commands.executeCommand('reverseProxy.test.clickSidebarItem', {
         parentLabel: 'ReverseTunnel',
-        label: 'ReverseTun: OFF'
+        label: '10.99.0.1:4001: Stopped'
       });
       await new Promise((resolve) => setTimeout(resolve, 700));
       assert.ok(
-        infos.some((m) => m.includes('Reverse proxy connected.')),
-        `Expected connected message after OFF click, got: ${infos.join(' | ')}`
+        infos.some((m) => m.includes('Reverse tunnel started: 10.99.0.1:4001')),
+        `Expected started message after row click, got: ${infos.join(' | ')}`
       );
 
       const treeAfterStart = await getSidebarChildren('ReverseTunnel');
       assert.strictEqual(treeAfterStart.length, 3);
-      assert.strictEqual(treeAfterStart[0]?.label, 'ReverseTun: ON');
-      assert.ok(treeAfterStart[0]?.enabled, 'ON button should be clickable');
+      assert.strictEqual(treeAfterStart[0]?.label, '10.99.0.1:4001: Started');
+      assert.ok(treeAfterStart[0]?.enabled, 'Started row should be clickable');
       assert.strictEqual(treeAfterStart[1]?.label, 'Open Logs');
       assert.strictEqual(treeAfterStart[2]?.label, 'Settings');
 
       await vscode.commands.executeCommand('reverseProxy.test.clickSidebarItem', {
         parentLabel: 'ReverseTunnel',
-        label: 'ReverseTun: ON'
+        label: '10.99.0.1:4001: Started'
       });
       await new Promise((resolve) => setTimeout(resolve, 350));
       const treeAfterStop = await getSidebarChildren('ReverseTunnel');
       assert.strictEqual(treeAfterStop.length, 3);
-      assert.strictEqual(treeAfterStop[0]?.label, 'ReverseTun: OFF');
-      assert.ok(treeAfterStop[0]?.enabled, 'OFF button should be clickable after stop');
+      assert.strictEqual(treeAfterStop[0]?.label, '10.99.0.1:4001: Stopped');
+      assert.ok(treeAfterStop[0]?.enabled, 'Stopped row should be clickable after stop');
       assert.strictEqual(treeAfterStop[1]?.label, 'Open Logs');
       assert.strictEqual(treeAfterStop[2]?.label, 'Settings');
     } finally {
       win.showInformationMessage = originalShowInformationMessage;
       delete process.env.RPX_FAKE_MODE;
-      await vscode.commands.executeCommand('reverseProxy.stop');
+      await vscode.commands.executeCommand('reverseProxy.test.stopRemoteTunnel', getDefaultRemoteKey());
+    }
+  });
+
+  test('external reverse tunnel should show Started but remain non-clickable', async () => {
+    let externalProcess: ChildProcessWithoutNullStreams | null = null;
+    try {
+      writeProxyConfig(29111, { sshPath: fakeSshPath, connectionReadyDelayMs: 200 });
+      await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
+      process.env.RPX_FAKE_MODE = 'success';
+      externalProcess = spawn(fakeSshPath, [
+        '-N',
+        '-p',
+        '4001',
+        '-o',
+        'ExitOnForwardFailure=yes',
+        '-o',
+        'ServerAliveInterval=30',
+        '-o',
+        'ServerAliveCountMax=3',
+        '-R',
+        '29111:127.0.0.1:7897',
+        'yangweijian@10.99.0.1'
+      ]);
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await vscode.commands.executeCommand('reverseProxy.test.syncStateFromSystem');
+
+      const items = await getSidebarChildren('ReverseTunnel');
+      assert.strictEqual(items[0]?.label, '10.99.0.1:4001: Started');
+      assert.strictEqual(items[0]?.description, 'external');
+      assert.strictEqual(items[0]?.enabled, false);
+      assert.ok(items[0]?.tooltip?.includes('Started externally'));
+    } finally {
+      delete process.env.RPX_FAKE_MODE;
+      if (externalProcess) {
+        externalProcess.kill();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await vscode.commands.executeCommand('reverseProxy.test.syncStateFromSystem');
     }
   });
 
@@ -660,14 +827,17 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     assert.ok(section, 'ReverseTunnel section should exist');
     assert.strictEqual(section.sshPath, 'ssh');
     assert.strictEqual(section.connectionReadyDelayMs, 1200);
-    assert.strictEqual(section.remoteHost, 'FOO_ADDRESS');
-    assert.strictEqual(section.remoteUser, 'FOO_USER');
+    assert.strictEqual(section.localHost, '127.0.0.1');
+    const remotes = section.remotes as Array<Record<string, unknown>>;
+    assert.ok(Array.isArray(remotes), 'ReverseTunnel.remotes should be an array');
+    assert.strictEqual(remotes[0]?.remoteHost, 'FOO_ADDRESS');
+    assert.strictEqual(remotes[0]?.remoteUser, 'FOO_USER');
 
     const updatedConfigFile = vscode.workspace.getConfiguration('reverseProxy').get<string>('configFile', '');
     assert.strictEqual(updatedConfigFile, createdPath);
   });
 
-  test('start command should show error when ssh does not exist', async () => {
+  test('remote row start should show error when ssh does not exist', async () => {
     let capturedError = '';
     const originalShowErrorMessage = win.showErrorMessage;
 
@@ -679,7 +849,7 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     try {
       writeProxyConfig(49017, { sshPath: '__definitely_missing_ssh_binary__', connectionReadyDelayMs: 200 });
       await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
-      await vscode.commands.executeCommand('reverseProxy.start');
+      await vscode.commands.executeCommand('reverseProxy.test.startRemoteTunnel', getDefaultRemoteKey());
 
       assert.ok(
         capturedError.includes('SSH command is unavailable'),
@@ -687,11 +857,11 @@ suite('Reverse Proxy Extension Integration Tests', () => {
       );
     } finally {
       win.showErrorMessage = originalShowErrorMessage;
-      await vscode.commands.executeCommand('reverseProxy.stop');
+      await vscode.commands.executeCommand('reverseProxy.test.stopRemoteTunnel', getDefaultRemoteKey());
     }
   });
 
-  test('start command should show error when config file path is invalid', async () => {
+  test('remote row start should show error when config file path is invalid', async () => {
     const errors: string[] = [];
     const originalShowErrorMessage = win.showErrorMessage;
 
@@ -702,7 +872,7 @@ suite('Reverse Proxy Extension Integration Tests', () => {
 
     try {
       await config.update('configFile', path.join(testDir, 'missing-config.json'), vscode.ConfigurationTarget.Global);
-      await vscode.commands.executeCommand('reverseProxy.start');
+      await vscode.commands.executeCommand('reverseProxy.test.startRemoteTunnel', getDefaultRemoteKey());
 
       assert.ok(
         errors.some((m) => m.includes('Failed to load reverse proxy config')),
@@ -711,11 +881,11 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     } finally {
       win.showErrorMessage = originalShowErrorMessage;
       await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
-      await vscode.commands.executeCommand('reverseProxy.stop');
+      await vscode.commands.executeCommand('reverseProxy.test.stopRemoteTunnel', getDefaultRemoteKey());
     }
   });
 
-  test('start command should show error when config file JSON is malformed', async () => {
+  test('remote row start should show error when config file JSON is malformed', async () => {
     const errors: string[] = [];
     const originalShowErrorMessage = win.showErrorMessage;
 
@@ -728,7 +898,7 @@ suite('Reverse Proxy Extension Integration Tests', () => {
       const brokenConfigPath = path.join(testDir, 'broken-config.json');
       fs.writeFileSync(brokenConfigPath, '{"remoteHost": "10.99.0.1",', 'utf8');
       await config.update('configFile', brokenConfigPath, vscode.ConfigurationTarget.Global);
-      await vscode.commands.executeCommand('reverseProxy.start');
+      await vscode.commands.executeCommand('reverseProxy.test.startRemoteTunnel', getDefaultRemoteKey());
 
       assert.ok(
         errors.some((m) => m.includes('Failed to load reverse proxy config')),
@@ -737,11 +907,11 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     } finally {
       win.showErrorMessage = originalShowErrorMessage;
       await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
-      await vscode.commands.executeCommand('reverseProxy.stop');
+      await vscode.commands.executeCommand('reverseProxy.test.stopRemoteTunnel', getDefaultRemoteKey());
     }
   });
 
-  test('start command should show clear error when remote port is occupied', async () => {
+  test('remote row start should show clear error when remote port is occupied', async () => {
     const errors: string[] = [];
     const originalShowErrorMessage = win.showErrorMessage;
     const occupiedPort = 28901;
@@ -757,7 +927,7 @@ suite('Reverse Proxy Extension Integration Tests', () => {
       process.env.RPX_FAKE_BIND_PORT = String(occupiedPort);
       await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
 
-      await vscode.commands.executeCommand('reverseProxy.start');
+      await vscode.commands.executeCommand('reverseProxy.test.startRemoteTunnel', getDefaultRemoteKey());
       await new Promise((resolve) => setTimeout(resolve, 800));
 
       assert.ok(
@@ -768,7 +938,7 @@ suite('Reverse Proxy Extension Integration Tests', () => {
       win.showErrorMessage = originalShowErrorMessage;
       delete process.env.RPX_FAKE_MODE;
       delete process.env.RPX_FAKE_BIND_PORT;
-      await vscode.commands.executeCommand('reverseProxy.stop');
+      await vscode.commands.executeCommand('reverseProxy.test.stopRemoteTunnel', getDefaultRemoteKey());
     }
   });
 
@@ -781,7 +951,7 @@ suite('Reverse Proxy Extension Integration Tests', () => {
     assert.ok(!script.includes('$ErrorActionPreference = "Stop" Get-CimInstance'));
   });
 
-  test('start command should show connected message when tunnel is established', async () => {
+  test('remote row start should show started message when tunnel is established', async () => {
     const infos: string[] = [];
     const originalShowInformationMessage = win.showInformationMessage;
 
@@ -795,17 +965,17 @@ suite('Reverse Proxy Extension Integration Tests', () => {
       process.env.RPX_FAKE_MODE = 'success';
       await config.update('configFile', testConfigFilePath, vscode.ConfigurationTarget.Global);
 
-      await vscode.commands.executeCommand('reverseProxy.start');
+      await vscode.commands.executeCommand('reverseProxy.test.startRemoteTunnel', getDefaultRemoteKey());
       await new Promise((resolve) => setTimeout(resolve, 700));
 
       assert.ok(
-        infos.some((m) => m.includes('Reverse proxy connected.')),
-        `Expected connected message, got: ${infos.join(' | ')}`
+        infos.some((m) => m.includes('Reverse tunnel started: 10.99.0.1:4001')),
+        `Expected started message, got: ${infos.join(' | ')}`
       );
     } finally {
       win.showInformationMessage = originalShowInformationMessage;
       delete process.env.RPX_FAKE_MODE;
-      await vscode.commands.executeCommand('reverseProxy.stop');
+      await vscode.commands.executeCommand('reverseProxy.test.stopRemoteTunnel', getDefaultRemoteKey());
     }
   });
 });

@@ -4,8 +4,8 @@
 
 ## 主要功能
 
-- 在侧边栏 `ToolBox` -> `ReverseTunnel` 中一键开关隧道
-- 状态栏显示当前状态：`Stopped` / `Starting` / `Connected` / `Failed`
+- 在侧边栏 `ToolBox` -> `ReverseTunnel` 中逐行开关多个远端隧道
+- 状态栏显示已启动 remote 数量
 - 内置日志入口（`Open Logs`）
 - 内置配置入口（`Settings`）
 - 启动前自动检查本机 `ssh` 命令可用性
@@ -16,7 +16,7 @@
 
 ### 状态栏
 
-- 文本仅展示状态
+- 文本展示已启动 remote 数量
 - 点击状态栏项会弹出当前状态（不执行 start/stop）
 
 ### 侧边栏
@@ -25,11 +25,12 @@ Activity Bar 图标：`ToolBox`
 视图名称：`ToolBox Status`  
 分组节点：`ReverseTunnel`
 
-子项行为：
+表格行为：
 
-- `ReverseTun: OFF`：点击后执行 `Start`
-- `ReverseTun: ON`：点击后执行 `Stop`
-- `ReverseTun: CONNECTING...`：连接中（不可点击）
+- `Host`：显示 `remoteHost:remotePort`
+- `State`：显示 `Stopped` / `Starting` / `Started` / `Failed`
+- `Action`：插件管理的 remote 可逐行 `Start` / `Stop`
+- 外部已存在的 tunnel 显示为 `Started`，但不可从插件停止
 - `Open Logs`：打开扩展输出日志
 - `Settings`：打开/创建配置文件
 
@@ -48,13 +49,17 @@ Activity Bar 图标：`ToolBox`
   "ReverseTunnel": {
     "sshPath": "ssh",
     "connectionReadyDelayMs": 1200,
-    "remoteHost": "FOO_ADDRESS",
-    "remotePort": 4001,
-    "remoteUser": "FOO_USER",
-    "remoteBindPort": 17897,
     "localHost": "127.0.0.1",
     "localPort": 7897,
-    "identityFile": ""
+    "remotes": [
+      {
+        "remoteHost": "FOO_ADDRESS",
+        "remotePort": 4001,
+        "remoteUser": "FOO_USER",
+        "remoteBindPort": 17897,
+        "identityFile": ""
+      }
+    ]
   }
 }
 ```

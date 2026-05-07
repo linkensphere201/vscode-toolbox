@@ -14,12 +14,9 @@
     "ui"
   ],
   "activationEvents": [
-    "onCommand:reverseProxy.start",
-    "onCommand:reverseProxy.stop",
     "onCommand:reverseProxy.showStatus",
     "onCommand:reverseProxy.showLogs",
     "onCommand:reverseProxy.openSettings",
-    "onCommand:reverseProxy.sidebarToggle",
     "onView:reverseProxy.sidebarView",
     "onCommand:reverseProxy.openKeyProjectSettings",
     "onCommand:reverseProxy.refreshKeyProjects"
@@ -27,14 +24,6 @@
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
-      {
-        "command": "reverseProxy.start",
-        "title": "Reverse Proxy: Start"
-      },
-      {
-        "command": "reverseProxy.stop",
-        "title": "Reverse Proxy: Stop"
-      },
       {
         "command": "reverseProxy.showStatus",
         "title": "Reverse Proxy: Show Status"
@@ -46,10 +35,6 @@
       {
         "command": "reverseProxy.openSettings",
         "title": "Reverse Proxy: Settings"
-      },
-      {
-        "command": "reverseProxy.sidebarToggle",
-        "title": "Reverse Proxy: Toggle From Sidebar"
       },
       {
         "command": "reverseProxy.refreshKeyProjects",
