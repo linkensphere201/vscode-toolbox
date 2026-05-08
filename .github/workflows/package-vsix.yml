@@ -11,7 +11,7 @@ permissions:
 jobs:
   package:
     name: Package VSIX
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -27,7 +27,7 @@ jobs:
         run: npm ci
 
       - name: Test
-        run: xvfb-run -a npm test
+        run: npm test
 
       - name: Package VSIX
         run: npm run package:vsix
