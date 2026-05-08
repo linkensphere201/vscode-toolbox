@@ -2,13 +2,13 @@
   "name": "code-ops-panel-extension",
   "displayName": "CodeOps Panel",
   "description": "CodeOps dashboard panel for reverse tunnels and pinned project status.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "YangWeijian",
   "license": "MIT",
   "icon": "media/Icon1.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/linkensphere201/vscode-toolbox.git"
+    "url": "https://github.com/linkensphere201/CodeOps-Panel.git"
   },
   "engines": {
     "vscode": "^1.90.0"

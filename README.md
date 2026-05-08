@@ -131,6 +131,6 @@ See `readme-cn.md` for Chinese usage documentation.
 
 [mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
 [mit-url]: LICENSE
-[actions-badge]: https://github.com/linkensphere201/vscode-toolbox/actions/workflows/ci.yml/badge.svg
-[actions-url]: https://github.com/linkensphere201/vscode-toolbox/actions/workflows/ci.yml
+[actions-badge]: https://github.com/linkensphere201/CodeOps-Panel/actions/workflows/ci.yml/badge.svg
+[actions-url]: https://github.com/linkensphere201/CodeOps-Panel/actions/workflows/ci.yml
 

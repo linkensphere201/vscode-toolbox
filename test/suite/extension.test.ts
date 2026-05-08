@@ -468,7 +468,7 @@ suite('CodeOps Panel Extension Integration Tests', () => {
     };
     assert.strictEqual(manifest.name, 'code-ops-panel-extension');
     assert.strictEqual(manifest.displayName, 'CodeOps Panel');
-    assert.strictEqual(manifest.version, '0.1.0');
+    assert.strictEqual(manifest.version, '0.1.1');
     assert.ok(Array.isArray(manifest.extensionKind), 'extensionKind should be an array');
     assert.deepStrictEqual(manifest.extensionKind, ['ui']);
     assert.ok(manifest.contributes?.configuration, 'reverse proxy settings should still be contributed');
